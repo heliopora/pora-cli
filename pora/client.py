@@ -208,12 +208,14 @@ class PoraClient:
         *,
         trigger: str = "on-change",
         period_days: int = 0,
+        tool_mode: int = 1,
     ) -> str:
         """Configure audit triggers.
 
         Args:
             trigger: "on-change", "periodic", or "both"
             period_days: days between periodic audits (required if trigger includes periodic)
+            tool_mode: 1=static, 2=static+llm, 3=llm-full
 
         returns: transaction hash
         """
@@ -225,7 +227,7 @@ class PoraClient:
         if mode == 0:
             mode = 0x01  # default: on-change
 
-        fn = self.contract.functions.setAuditConfig(bounty_id, mode, 1, 1, period_days)
+        fn = self.contract.functions.setAuditConfig(bounty_id, mode, 1, tool_mode, period_days)
         return self._send_tx(fn)
 
     def set_delivery_key(self, bounty_id: int, *, pub_key_hex: str) -> str:

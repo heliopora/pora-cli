@@ -49,10 +49,12 @@ def bounty():
 @click.option("--installation-id", "-i", type=int, required=True, help="GitHub App installation ID")
 @click.option("--trigger", "-t", default="on-change", help="Trigger mode: on-change, periodic, both")
 @click.option("--period-days", type=int, default=0, help="Days between periodic audits")
+@click.option("--tool-mode", type=int, default=1, help="1=static, 2=static+llm, 3=llm-full")
+@click.option("--delivery-key", type=str, default="", help="Path to X25519 public key file for encrypted delivery")
 @click.option("--private-key", envvar="PORA_PRIVATE_KEY", help="Wallet private key")
 @click.option("--rpc", envvar="PORA_RPC_URL", default="", help="Sapphire RPC URL")
 @click.option("--contract", envvar="PORA_CONTRACT", default="", help="LetheMarket address")
-def bounty_create(repo, amount, duration, standing, installation_id, trigger, period_days, private_key, rpc, contract):
+def bounty_create(repo, amount, duration, standing, installation_id, trigger, period_days, tool_mode, delivery_key, private_key, rpc, contract):
     """Create a bounty for REPO (owner/repo format).
 
     Example: pora bounty create lethe-protocol/lethe-market --amount 1 -i 122858796
@@ -68,8 +70,17 @@ def bounty_create(repo, amount, duration, standing, installation_id, trigger, pe
     click.echo(f"Repo linked.")
 
     click.echo(f"Setting audit config ({trigger})...")
-    client.set_audit_config(bounty_id, trigger=trigger, period_days=period_days)
+    client.set_audit_config(bounty_id, trigger=trigger, period_days=period_days, tool_mode=tool_mode)
     click.echo(f"Config set.")
+
+    if delivery_key:
+        import os
+        if os.path.isfile(delivery_key):
+            pub_hex = open(delivery_key).read().strip()
+        else:
+            pub_hex = delivery_key
+        client.set_delivery_key(bounty_id, pub_key_hex=pub_hex)
+        click.echo("Delivery key registered.")
 
     click.echo(f"\n✓ Bounty #{bounty_id} is live. ROFL worker will pick it up on next poll cycle.")
 
@@ -117,6 +128,86 @@ def bounty_cancel(bounty_id, private_key, rpc, contract):
     client = _client(private_key=private_key, rpc_url=rpc, contract_address=contract)
     tx = client.cancel_bounty(bounty_id)
     click.echo(f"Cancelled bounty #{bounty_id}. tx={tx}")
+
+
+@bounty.command("watch")
+@click.argument("bounty_id", type=int)
+@click.option("--interval", "-i", type=int, default=30, help="Poll interval in seconds")
+@click.option("--rpc", envvar="PORA_RPC_URL", default="")
+@click.option("--contract", envvar="PORA_CONTRACT", default="")
+def bounty_watch(bounty_id, interval, rpc, contract):
+    """Watch a bounty for audit completion."""
+    import time
+    client = _client(rpc_url=rpc, contract_address=contract)
+
+    last_audit_count = client.get_bounty(bounty_id).audit_count
+    click.echo(f"Watching bounty #{bounty_id} (current audits: {last_audit_count})...")
+
+    while True:
+        time.sleep(interval)
+        try:
+            b = client.get_bounty(bounty_id)
+            if b.audit_count > last_audit_count:
+                # New audit completed
+                audit_id = client.audit_count()  # latest audit
+                a = client.get_audit(audit_id)
+                result = "Findings" if a.result == 0 else "NoFindings"
+                payout = client.w3.from_wei(a.payout, 'ether')
+                click.echo(f"\n  Audit #{audit_id} complete!")
+                click.echo(f"  Result: {result} ({a.finding_count} findings)")
+                click.echo(f"  Payout: {payout} ROSE")
+                last_audit_count = b.audit_count
+
+                # Check if delivery is ready
+                d = client.get_delivery(audit_id)
+                if d.delivery_status == 1:
+                    click.echo(f"  Delivery: Ready")
+                    click.echo(f"  Retrieve: pora audit retrieve {audit_id} --key <your-key>")
+                break
+            else:
+                click.echo(".", nl=False)
+        except Exception as e:
+            click.echo(f"\n  Error: {e}")
+
+
+# ── Performer commands ──
+
+
+@main.group()
+def performer():
+    """Manage performer agent configuration."""
+    pass
+
+
+@performer.command("estimate")
+@click.option("--provider", default="anthropic", help="LLM provider")
+@click.option("--model", default="", help="Model name")
+@click.option("--rpc", envvar="PORA_RPC_URL", default="")
+@click.option("--contract", envvar="PORA_CONTRACT", default="")
+def performer_estimate(provider, model, rpc, contract):
+    """Estimate costs and potential earnings for performing audits."""
+    client = _client(rpc_url=rpc, contract_address=contract)
+    bounties = client.list_bounties(only_open=True)
+
+    if not bounties:
+        click.echo("No open bounties. Nothing to estimate.")
+        return
+
+    # Rough API cost estimates per provider
+    cost_per_audit = {"anthropic": 0.15, "openai": 0.10, "openrouter": 0.08}
+    api_cost = cost_per_audit.get(provider, 0.15)
+
+    click.echo(f"Open bounties: {len(bounties)}")
+    click.echo(f"Provider: {provider} (est. ${api_cost:.2f}/audit)")
+    click.echo()
+    for b in bounties:
+        pool = client.w3.from_wei(b.amount, 'ether')
+        policy = client.payout_policy()
+        per_audit = float(pool) * policy.standing_percent_bps / 10000
+        base_fee = per_audit * policy.execution_fee_bps / 10000
+        click.echo(f"  Bounty #{b.id}: {pool} ROSE pool")
+        click.echo(f"    Per audit: {per_audit:.4f} ROSE total, {base_fee:.4f} ROSE base fee")
+        click.echo(f"    API cost: ~${api_cost:.2f} -> {'profitable' if float(base_fee) * 0.08 > api_cost else 'need findings for profit'}")
 
 
 # ── Delivery commands ──
