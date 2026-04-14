@@ -24,10 +24,21 @@ serde_json = "1"
 # HTTP
 reqwest = { version = "0.12", features = ["json"] }
 
-# Crypto (secp256k1 key derivation)
+# Crypto (secp256k1 key derivation + tx signing)
 k256 = { version = "0.13", features = ["ecdsa"] }
 hex = "0.4"
 tiny-keccak = { version = "2", features = ["keccak"] }
+
+# RLP encoding (AD-1: modular alloy — alloy-rlp available for future use)
+alloy-rlp = "0.3"
+
+# Crypto: X25519 + HKDF + AES-GCM (delivery decryption, AD-3)
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+hkdf = "0.12"
+sha2 = "0.10"
+aes-gcm = "0.10"
+base64 = "0.22"
+rand = "0.8"
 
 # Errors
 anyhow = "1"

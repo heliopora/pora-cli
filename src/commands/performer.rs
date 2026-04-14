@@ -1,6 +1,9 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Subcommand;
+use serde_json::json;
 
+use crate::abi;
+use crate::config;
 use crate::output::{self, Format};
 
 #[derive(Subcommand)]
@@ -14,14 +17,115 @@ pub enum PerformerAction {
         #[arg(long)]
         use_claude_login: bool,
     },
-    /// Start autonomous audit loop (emits NDJSON events)
+    /// Monitor on-chain events for this performer (read-only, NDJSON stream)
     Start {
-        /// Run one audit cycle then exit
+        /// Poll interval in seconds
+        #[arg(long, default_value = "5")]
+        interval: u64,
+        /// Snapshot current state then exit
         #[arg(long)]
         once: bool,
     },
     /// Show earnings, reputation, and active jobs
     Status,
+}
+
+/// Monitor on-chain events for this performer (read-only, per AD-2).
+// WHY: this is a read-only observer, NOT a TEE control plane.
+//      The TEE (ROFL container) runs autonomously. This command provides visibility.
+async fn execute_start(interval: u64, once: bool) -> Result<()> {
+    let cfg = config::load_config();
+    let rpc = crate::rpc::RpcClient::new(&cfg.rpc_url);
+
+    // Load performer address
+    let performer_address = if let Ok(key) = config::get_private_key() {
+        crate::crypto::private_key_to_address(&key)?
+    } else {
+        // Try loading from ~/.pora/performer.json
+        load_performer_address()
+            .context("No performer key found. Set PORA_PRIVATE_KEY or run 'pora performer init'")?
+    };
+
+    // Verify performer registration
+    let calldata = abi::encode_get_performer(&performer_address);
+    match rpc.eth_call(&cfg.contract, &calldata).await {
+        Ok(result) => {
+            if abi::is_zero_result(&result) {
+                anyhow::bail!(
+                    "Address {} is not registered as a performer",
+                    performer_address
+                );
+            }
+        }
+        Err(e) => {
+            // WHY: don't fail hard — the contract may not have getPerformer. Warn and continue.
+            output::ndjson_event(json!({
+                "event": "warning",
+                "message": format!("Could not verify registration: {}", e),
+            }));
+        }
+    }
+
+    let addr_clean = performer_address.trim_start_matches("0x").to_lowercase();
+    let performer_topic = format!("0x000000000000000000000000{}", addr_clean);
+
+    const ONCE_LOOKBACK: u64 = 50_000;
+    let current = rpc.eth_block_number().await?;
+    let mut from_block = if once { current.saturating_sub(ONCE_LOOKBACK) } else { current };
+    let sleep_dur = tokio::time::Duration::from_secs(interval);
+    let mut heartbeat_counter = 0u64;
+
+    loop {
+        let current_block = rpc.eth_block_number().await.unwrap_or(from_block);
+
+        if current_block >= from_block {
+            let from_hex = format!("0x{:x}", from_block);
+            let to_hex = format!("0x{:x}", current_block);
+
+            // AuditPayoutClaimed — performer is topic[2], filter directly
+            rpc.fetch_and_emit_logs(
+                &cfg.contract,
+                &[Some(abi::audit_payout_claimed_topic()), None, Some(&performer_topic)],
+                &from_hex, &to_hex, "payout.claimed",
+            ).await;
+
+            // Events without performer index — emit all, client correlates
+            for (topic0, event_name) in [
+                (abi::audit_submitted_topic(), "audit.submitted"),
+                (abi::audit_result_submitted_topic(), "audit.result_submitted"),
+                (abi::audit_delivery_recorded_topic(), "audit.delivery_recorded"),
+            ] {
+                rpc.fetch_and_emit_logs(
+                    &cfg.contract, &[Some(topic0)],
+                    &from_hex, &to_hex, event_name,
+                ).await;
+            }
+
+            from_block = current_block + 1;
+        }
+
+        heartbeat_counter += 1;
+        output::ndjson_event(json!({
+            "event": "heartbeat",
+            "block": current_block,
+            "performer": performer_address,
+            "tick": heartbeat_counter,
+        }));
+
+        if once { return Ok(()); }
+
+        tokio::select! {
+            _ = tokio::time::sleep(sleep_dur) => {},
+            _ = tokio::signal::ctrl_c() => { return Ok(()); }
+        }
+    }
+}
+
+fn load_performer_address() -> Option<String> {
+    let path = config::config_dir().join("performer.json");
+    let content = std::fs::read_to_string(path).ok()?;
+    let val: serde_json::Value = serde_json::from_str(&content).ok()?;
+    val["address"].as_str().map(|s| s.to_string())
 }
 
 pub async fn run(action: PerformerAction, format: &Format) -> Result<()> {
@@ -68,13 +172,8 @@ pub async fn run(action: PerformerAction, format: &Format) -> Result<()> {
             });
             output::print_success(format, "performer.init", &info);
         }
-        PerformerAction::Start { once } => {
-            let info = serde_json::json!({
-                "mode": if once { "single" } else { "continuous" },
-                "status": "not_implemented",
-                "message": "Autonomous audit loop will: poll → claim → TEE audit → submit → collect"
-            });
-            output::print_success(format, "performer.start", &info);
+        PerformerAction::Start { interval, once } => {
+            execute_start(interval, once).await?;
         }
         PerformerAction::Status => {
             let info = serde_json::json!({

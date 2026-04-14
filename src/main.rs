@@ -1,9 +1,14 @@
 use clap::{Parser, Subcommand};
 
+mod abi;
 mod commands;
 mod config;
 mod contract;
+mod crypto;
+mod github;
 mod output;
+mod rpc;
+mod tx;
 
 #[derive(Parser)]
 #[command(name = "pora")]

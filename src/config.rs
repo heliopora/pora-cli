@@ -49,6 +49,24 @@ pub fn load_config() -> Config {
     }
 }
 
+/// Returns ~/.pora/keys/ path, creating it with mode 0700 if needed.
+// SECURITY: key directory must be owner-only readable
+pub fn keys_dir() -> Option<PathBuf> {
+    let dir = config_dir().join("keys");
+    if !dir.exists() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&dir).ok()?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir_all(&dir).ok()?;
+        }
+    }
+    Some(dir)
+}
+
 pub fn get_private_key() -> Result<String> {
     // Priority: env var > config file
     if let Ok(key) = std::env::var("PORA_PRIVATE_KEY") {

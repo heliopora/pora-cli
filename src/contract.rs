@@ -1,23 +1,9 @@
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::json;
-use tiny_keccak::{Hasher, Keccak};
 
 use crate::config;
-
-// ABI function selectors (keccak256 of signature, first 4 bytes)
-fn keccak256(data: &[u8]) -> [u8; 32] {
-    let mut hasher = Keccak::v256();
-    let mut output = [0u8; 32];
-    hasher.update(data);
-    hasher.finalize(&mut output);
-    output
-}
-
-fn selector(sig: &str) -> [u8; 4] {
-    let hash = keccak256(sig.as_bytes());
-    [hash[0], hash[1], hash[2], hash[3]]
-}
+use crate::crypto::{keccak256, selector};
 
 fn encode_uint256(value: u64) -> Vec<u8> {
     let mut buf = vec![0u8; 32];
