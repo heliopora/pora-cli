@@ -529,7 +529,7 @@ pub async fn execute_dispute(audit_id: u64) -> Result<serde_json::Value> {
     let data = abi::encode_dispute_audit(audit_id);
     let (tx_hash, _receipt) = tx::send_and_confirm(&cfg.contract, 0, data, 200_000)
         .await
-        .context("disputeAudit transaction failed")?;
+        .context("disputeAudit transaction failed (audit may not exist, not in disputable state, or challenge window expired)")?;
     Ok(serde_json::json!({
         "audit_id": audit_id,
         "tx": tx_hash,

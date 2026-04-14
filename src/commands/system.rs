@@ -77,6 +77,22 @@ pub fn execute_keygen(force: bool) -> Result<serde_json::Value> {
             "Keys already exist at ~/.pora/keys/. Use --force to regenerate."
         );
     }
+    // WHY: delivery keys decrypt audit results — losing them means losing access to past results.
+    //      backup before overwrite so the user can recover if needed.
+    if force && crypto::delivery_keys_exist() {
+        let keys_dir = dirs::home_dir().unwrap().join(".pora/keys");
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        for name in &["delivery.key", "delivery.pub"] {
+            let src = keys_dir.join(name);
+            if src.exists() {
+                let backup = keys_dir.join(format!("{}.bak.{}", name, timestamp));
+                std::fs::copy(&src, &backup)?;
+            }
+        }
+    }
     let (priv_path, pub_path) = crypto::generate_x25519_keypair()?;
     let pubkey_hex = std::fs::read_to_string(&pub_path)?;
     Ok(serde_json::json!({

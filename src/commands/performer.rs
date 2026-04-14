@@ -302,7 +302,7 @@ pub async fn execute_release_claim(bounty_id: u64) -> Result<serde_json::Value> 
     let data = crate::abi::encode_release_bounty_claim(bounty_id);
     let (tx_hash, _receipt) = crate::tx::send_and_confirm(&cfg.contract, 0, data, 200_000)
         .await
-        .context("releaseBountyClaim transaction failed")?;
+        .context("releaseBountyClaim transaction failed (you may not have an active claim on this bounty)")?;
     Ok(serde_json::json!({
         "bounty_id": bounty_id,
         "tx": tx_hash,
