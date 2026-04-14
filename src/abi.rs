@@ -41,6 +41,7 @@ fn encode_uint8(value: u8) -> Vec<u8> {
 // returns: 32-byte left-padded address
 pub fn encode_address(address_hex: &str) -> Vec<u8> {
     let clean = address_hex.trim_start_matches("0x").to_lowercase();
+    assert_eq!(clean.len(), 40, "address must be 40 hex chars, got {}", clean.len());
     let addr_bytes = hex::decode(&clean).expect("invalid address hex");
     let mut buf = vec![0u8; 12];
     buf.extend_from_slice(&addr_bytes);
@@ -452,8 +453,8 @@ pub fn encode_get_delivery_config(bounty_id: u64) -> String {
 // returns: calldata for getPendingClaim — polls claim state during 2-step flow
 pub fn encode_get_pending_claim(bounty_id: u64, performer_address: &str) -> String {
     let sel = &keccak256(b"getPendingClaim(uint256,address)")[..4];
-    let addr_clean = performer_address.trim_start_matches("0x").to_lowercase();
-    format!("0x{}{:064x}{:0>64}", hex::encode(sel), bounty_id, addr_clean)
+    let addr_bytes = encode_address(performer_address);
+    format!("0x{}{:064x}{}", hex::encode(sel), bounty_id, hex::encode(addr_bytes))
 }
 
 // --- View Call Decoding ---
