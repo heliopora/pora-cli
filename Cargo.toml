@@ -24,10 +24,16 @@ serde_json = "1"
 # HTTP
 reqwest = { version = "0.12", features = ["json"] }
 
+# Crypto (secp256k1 key derivation)
+k256 = { version = "0.13", features = ["ecdsa"] }
+hex = "0.4"
+tiny-keccak = { version = "2", features = ["keccak"] }
+
 # Errors
 anyhow = "1"
 
 # Config
+toml = "0.8"
 dirs = "6"
 
 # TTY detection

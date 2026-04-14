@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Subcommand;
-use serde::Serialize;
 
+use crate::contract;
 use crate::output::{self, Format};
 
 #[derive(Subcommand)]
@@ -19,12 +19,13 @@ pub enum RequestAction {
         /// Audit mode: static, tee-local, tee-api
         #[arg(long, default_value = "tee-api")]
         mode: String,
-        /// Delivery mode: encrypted, github-comment
-        #[arg(long, default_value = "encrypted")]
-        delivery: String,
     },
-    /// List your bounties
-    List,
+    /// List bounties on the market
+    List {
+        /// Include closed/cancelled bounties
+        #[arg(long)]
+        all: bool,
+    },
     /// Watch a bounty for audit completion (streams NDJSON events)
     Watch {
         /// Bounty ID
@@ -37,41 +38,27 @@ pub enum RequestAction {
     },
 }
 
-#[derive(Serialize)]
-struct BountyInfo {
-    bounty_id: u64,
-    repo: String,
-    amount: String,
-    state: String,
-    audit_count: u64,
-}
-
 pub async fn run(action: RequestAction, format: &Format) -> Result<()> {
     match action {
-        RequestAction::Submit { repo, amount, trigger, mode, delivery } => {
-            // TODO: implement atomic bounty creation
+        RequestAction::Submit { repo, amount, trigger, mode } => {
             let info = serde_json::json!({
-                "bounty_id": 0,
                 "repo": repo,
                 "amount": format!("{} ROSE", amount),
                 "trigger": trigger,
                 "mode": mode,
-                "delivery": delivery,
                 "status": "not_implemented",
                 "message": "Atomic submit will chain: createBounty + setRepoInfo + setAuditConfig + setDeliveryConfig"
             });
             output::print_success(format, "request.submit", &info);
         }
-        RequestAction::List => {
-            // TODO: query contract for bounties
-            let info = serde_json::json!({
-                "bounties": [],
-                "status": "not_implemented"
-            });
-            output::print_success(format, "request.list", &info);
+        RequestAction::List { all } => {
+            let bounties = contract::list_bounties(!all).await?;
+            output::print_success(format, "request.list", &serde_json::json!({
+                "bounties": bounties,
+                "count": bounties.len(),
+            }));
         }
         RequestAction::Watch { bounty_id } => {
-            // TODO: poll for audit events, emit NDJSON
             let info = serde_json::json!({
                 "bounty_id": bounty_id,
                 "status": "not_implemented"
@@ -79,7 +66,6 @@ pub async fn run(action: RequestAction, format: &Format) -> Result<()> {
             output::print_success(format, "request.watch", &info);
         }
         RequestAction::Results { audit_id } => {
-            // TODO: auto-resolve handle, download, decrypt
             let info = serde_json::json!({
                 "audit_id": audit_id,
                 "status": "not_implemented"
