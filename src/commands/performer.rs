@@ -32,6 +32,8 @@ fn compute_config_hash() -> Result<[u8; 32]> {
         .context("performer.json not found. Run 'pora performer init' first")?;
     let performer: serde_json::Value = serde_json::from_str(&content)?;
 
+    // TRUST: these must match the deployed TEE image exactly.
+    //        Default values are for local dev only — production MUST set all three.
     let app_id = std::env::var("PORA_ROFL_APP_ID")
         .unwrap_or_else(|_| "rofl1qr98wz5t6q4dcnlmjhkleqkghk240ruv6pjxvgn".to_string());
     let cli = performer.get("provider")
@@ -42,6 +44,16 @@ fn compute_config_hash() -> Result<[u8; 32]> {
         .unwrap_or_else(|_| "default".to_string());
     let image_hash = std::env::var("PORA_IMAGE_HASH")
         .unwrap_or_else(|_| "dev".to_string());
+
+    if std::env::var("PORA_ROFL_APP_ID").is_err()
+        || std::env::var("PORA_MODEL").is_err()
+        || std::env::var("PORA_IMAGE_HASH").is_err()
+    {
+        output::ndjson_event(json!({
+            "event": "warning",
+            "message": "Using dev defaults for configHash (PORA_ROFL_APP_ID/PORA_MODEL/PORA_IMAGE_HASH not set). TEE will reject in production.",
+        }));
+    }
 
     let mut packed = Vec::new();
     packed.extend_from_slice(app_id.as_bytes());
@@ -391,7 +403,8 @@ pub async fn execute_claim(bounty_id: u64, timeout: u64) -> Result<serde_json::V
 
     let poll_interval = tokio::time::Duration::from_secs(3);
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout);
-    let start_block = rpc.eth_block_number().await.unwrap_or(0);
+    let start_block = rpc.eth_block_number().await
+        .context("Cannot fetch block number for event polling")?;
 
     loop {
         if tokio::time::Instant::now() >= deadline {
@@ -429,11 +442,21 @@ pub async fn execute_claim(bounty_id: u64, timeout: u64) -> Result<serde_json::V
         ).await {
             if let Some(log) = logs.first() {
                 let reason_data = log["data"].as_str().unwrap_or("0x");
+                // WHY: reason is keccak256 of a human-readable string (e.g. "CONFIG_MISMATCH").
+                //      We can't reverse the hash, but known codes are documented in the spec.
+                let reason_hint = match reason_data.get(2..66).unwrap_or("") {
+                    s if s == hex::encode(crate::crypto::keccak256(b"CONFIG_MISMATCH")) => "CONFIG_MISMATCH — your configHash doesn't match the TEE's. Check PORA_ROFL_APP_ID/PORA_MODEL/PORA_IMAGE_HASH.",
+                    s if s == hex::encode(crate::crypto::keccak256(b"TRUST_POLICY_MISMATCH")) => "TRUST_POLICY_MISMATCH — your provider/model/URL doesn't match the bounty's trust policy.",
+                    s if s == hex::encode(crate::crypto::keccak256(b"BOUNTY_UNAVAILABLE")) => "BOUNTY_UNAVAILABLE — bounty is no longer open or trust policy unreadable.",
+                    s if s == hex::encode(crate::crypto::keccak256(b"COMPLEXITY_EXCEEDED")) => "COMPLEXITY_EXCEEDED — repository exceeds performer's declared capacity.",
+                    _ => "Unknown reason code.",
+                };
                 return Ok(json!({
                     "bounty_id": bounty_id,
                     "status": "rejected",
                     "reason": reason_data,
-                    "message": "Claim rejected by TEE. Check reason code.",
+                    "reason_hint": reason_hint,
+                    "message": format!("Claim rejected by TEE: {}", reason_hint),
                     "tx": tx_hash,
                 }));
             }
