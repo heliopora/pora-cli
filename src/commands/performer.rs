@@ -18,6 +18,40 @@ fn resolve_performer_address() -> Result<String> {
     }
 }
 
+/// Compute configHash = keccak256(app_id + cli + model + image_hash).
+// checks: performer.json must exist with provider field
+// effects: none
+// returns: 32-byte config hash matching the TEE's compute_config_hash()
+//
+// WHY: this must match exactly what the ROFL worker computes in main.py's
+//      compute_config_hash(). Mismatch = confused-deputy rejection.
+// SECURITY: encodePacked concatenation — order matters. Must match Solidity/Python.
+fn compute_config_hash() -> Result<[u8; 32]> {
+    let performer_path = config::config_dir().join("performer.json");
+    let content = std::fs::read_to_string(&performer_path)
+        .context("performer.json not found. Run 'pora performer init' first")?;
+    let performer: serde_json::Value = serde_json::from_str(&content)?;
+
+    let app_id = std::env::var("PORA_ROFL_APP_ID")
+        .unwrap_or_else(|_| "rofl1qr98wz5t6q4dcnlmjhkleqkghk240ruv6pjxvgn".to_string());
+    let cli = performer.get("provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or("anthropic")
+        .to_string();
+    let model = std::env::var("PORA_MODEL")
+        .unwrap_or_else(|_| "default".to_string());
+    let image_hash = std::env::var("PORA_IMAGE_HASH")
+        .unwrap_or_else(|_| "dev".to_string());
+
+    let mut packed = Vec::new();
+    packed.extend_from_slice(app_id.as_bytes());
+    packed.extend_from_slice(cli.as_bytes());
+    packed.extend_from_slice(model.as_bytes());
+    packed.extend_from_slice(image_hash.as_bytes());
+
+    Ok(crate::crypto::keccak256(&packed))
+}
+
 #[derive(Subcommand)]
 pub enum PerformerAction {
     /// Initialize performer config (wallet, provider, API key)
@@ -49,6 +83,14 @@ pub enum PerformerAction {
     ReleaseClaim {
         /// Bounty ID
         bounty_id: u64,
+    },
+    /// Request a bounty claim (2-step: local requestClaim -> TEE claimBounty)
+    Claim {
+        /// Bounty ID to claim
+        bounty_id: u64,
+        /// Poll timeout in seconds (default: 120, max wait for TEE confirmation)
+        #[arg(long, default_value = "120")]
+        timeout: u64,
     },
 }
 
@@ -309,6 +351,108 @@ pub async fn execute_release_claim(bounty_id: u64) -> Result<serde_json::Value> 
     }))
 }
 
+/// Request a bounty claim and wait for TEE confirmation.
+// checks: private key configured, performer.json exists
+// effects: sends requestClaim tx, polls for BountyClaimAcquired/ClaimRejected events
+// returns: structured JSON with claim result (acquired or rejected)
+//
+// WHY: 2-step claim flow. Local CLI sends requestClaim, then polls for TEE response.
+//      This is the performer's entry point to the TEE audit pipeline.
+// SECURITY: configHash binds the claim to the performer's actual config.
+//           TEE verifies this before confirming — confused-deputy defense.
+pub async fn execute_claim(bounty_id: u64, timeout: u64) -> Result<serde_json::Value> {
+    let _key = crate::config::get_private_key()
+        .context("Wallet required for claim. Set PORA_PRIVATE_KEY")?;
+    let cfg = crate::config::load_config();
+    let rpc = crate::rpc::RpcClient::new(&cfg.rpc_url);
+    let performer_address = resolve_performer_address()?;
+
+    // Step 1: Compute configHash
+    let config_hash = compute_config_hash()
+        .context("Cannot compute configHash — check performer.json and env vars")?;
+
+    // Step 2: Send requestClaim transaction
+    let data = abi::encode_request_claim(bounty_id, &config_hash);
+    let (tx_hash, _receipt) = crate::tx::send_and_confirm(&cfg.contract, 0, data, 200_000)
+        .await
+        .context("requestClaim transaction failed (bounty may not be open or you have a pending claim)")?;
+
+    output::ndjson_event(json!({
+        "event": "claim.request_sent",
+        "bounty_id": bounty_id,
+        "config_hash": format!("0x{}", hex::encode(config_hash)),
+        "tx": tx_hash,
+    }));
+
+    // Step 3: Poll for TEE response (BountyClaimAcquired or ClaimRejected)
+    let addr_clean = performer_address.trim_start_matches("0x").to_lowercase();
+    let performer_topic = format!("0x000000000000000000000000{}", addr_clean);
+    let bounty_topic = format!("0x{:064x}", bounty_id);
+
+    let poll_interval = tokio::time::Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout);
+    let start_block = rpc.eth_block_number().await.unwrap_or(0);
+
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(json!({
+                "bounty_id": bounty_id,
+                "status": "timeout",
+                "message": format!("No TEE response within {}s. Claim may still be pending — check with 'pora performer status'", timeout),
+                "tx": tx_hash,
+            }));
+        }
+
+        let current_block = rpc.eth_block_number().await.unwrap_or(start_block);
+
+        // Check for BountyClaimAcquired(uint256 indexed bountyId, address indexed performer)
+        if let Ok(logs) = rpc.eth_get_logs_chunked(
+            &cfg.contract,
+            &[Some(abi::bounty_claim_acquired_topic()), Some(&bounty_topic), Some(&performer_topic)],
+            start_block, current_block,
+        ).await {
+            if !logs.is_empty() {
+                return Ok(json!({
+                    "bounty_id": bounty_id,
+                    "status": "acquired",
+                    "message": "Bounty claim confirmed by TEE. Audit will begin shortly.",
+                    "tx": tx_hash,
+                }));
+            }
+        }
+
+        // Check for ClaimRejected(uint256 indexed bountyId, address indexed performer, bytes32 reason)
+        if let Ok(logs) = rpc.eth_get_logs_chunked(
+            &cfg.contract,
+            &[Some(abi::claim_rejected_topic()), Some(&bounty_topic), Some(&performer_topic)],
+            start_block, current_block,
+        ).await {
+            if let Some(log) = logs.first() {
+                let reason_data = log["data"].as_str().unwrap_or("0x");
+                return Ok(json!({
+                    "bounty_id": bounty_id,
+                    "status": "rejected",
+                    "reason": reason_data,
+                    "message": "Claim rejected by TEE. Check reason code.",
+                    "tx": tx_hash,
+                }));
+            }
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(poll_interval) => {},
+            _ = tokio::signal::ctrl_c() => {
+                return Ok(json!({
+                    "bounty_id": bounty_id,
+                    "status": "interrupted",
+                    "message": "Polling interrupted. Claim may still be pending.",
+                    "tx": tx_hash,
+                }));
+            }
+        }
+    }
+}
+
 /// Initialize performer config.
 // checks: provider is valid, API key or Claude OAuth available
 // effects: writes ~/.pora/performer.json
@@ -454,6 +598,10 @@ pub async fn run(action: PerformerAction, format: &Format) -> Result<()> {
         PerformerAction::ReleaseClaim { bounty_id } => {
             let data = execute_release_claim(bounty_id).await?;
             output::print_success(format, "performer.release_claim", &data);
+        }
+        PerformerAction::Claim { bounty_id, timeout } => {
+            let data = execute_claim(bounty_id, timeout).await?;
+            output::print_success(format, "performer.claim", &data);
         }
     }
     Ok(())
