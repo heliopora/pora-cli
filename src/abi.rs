@@ -35,6 +35,18 @@ fn encode_uint8(value: u8) -> Vec<u8> {
     buf
 }
 
+/// ABI-encode an Ethereum address as 32 bytes (12 zero bytes + 20 address bytes).
+// checks: address_hex is 40 hex chars (with or without 0x prefix)
+// effects: none
+// returns: 32-byte left-padded address
+pub fn encode_address(address_hex: &str) -> Vec<u8> {
+    let clean = address_hex.trim_start_matches("0x").to_lowercase();
+    let addr_bytes = hex::decode(&clean).expect("invalid address hex");
+    let mut buf = vec![0u8; 12];
+    buf.extend_from_slice(&addr_bytes);
+    buf
+}
+
 // checks: none
 // effects: none
 // returns: ABI-encoded dynamic string (offset is handled by caller)
@@ -203,6 +215,19 @@ pub fn encode_claim_audit_payout(audit_id: u64) -> Vec<u8> {
     data
 }
 
+/// Encode requestClaim(uint256 _bountyId, bytes32 _configHash)
+// checks: config_hash is 32 bytes
+// effects: none
+// returns: calldata for requestClaim — the local (non-TEE) half of the 2-step claim flow
+// WHY: performer's local CLI calls this to signal intent. TEE verifies configHash
+//      and confirms via claimBounty.
+pub fn encode_request_claim(bounty_id: u64, config_hash: &[u8; 32]) -> Vec<u8> {
+    let mut data = selector("requestClaim(uint256,bytes32)").to_vec();
+    data.extend(encode_uint256(bounty_id));
+    data.extend_from_slice(config_hash);
+    data
+}
+
 /// Encode registeredPerformers(address) — public mapping auto-getter on LetheMarket.
 // checks: none
 // effects: none
@@ -252,6 +277,14 @@ static AUDIT_PAYOUT_CLAIMED: LazyLock<String> =
 static AUDIT_DELIVERY_RECORDED: LazyLock<String> =
     LazyLock::new(|| event_topic("AuditDeliveryRecorded(uint256,uint8,uint8,bytes32,bytes32)"));
 
+// TEE 2-step claim flow events
+static CLAIM_REQUESTED: LazyLock<String> =
+    LazyLock::new(|| event_topic("ClaimRequested(uint256,address,bytes32)"));
+static BOUNTY_CLAIM_ACQUIRED: LazyLock<String> =
+    LazyLock::new(|| event_topic("BountyClaimAcquired(uint256,address)"));
+static CLAIM_REJECTED: LazyLock<String> =
+    LazyLock::new(|| event_topic("ClaimRejected(uint256,address,bytes32)"));
+
 /// Events indexed by bountyId in topic[1].
 pub fn bounty_event_topics() -> Vec<(&'static str, &'static str)> {
     vec![
@@ -274,6 +307,9 @@ pub fn audit_submitted_topic() -> &'static str { &AUDIT_SUBMITTED }
 pub fn audit_result_submitted_topic() -> &'static str { &AUDIT_RESULT_SUBMITTED }
 pub fn audit_payout_claimed_topic() -> &'static str { &AUDIT_PAYOUT_CLAIMED }
 pub fn audit_delivery_recorded_topic() -> &'static str { &AUDIT_DELIVERY_RECORDED }
+pub fn claim_requested_topic() -> &'static str { &CLAIM_REQUESTED }
+pub fn bounty_claim_acquired_topic() -> &'static str { &BOUNTY_CLAIM_ACQUIRED }
+pub fn claim_rejected_topic() -> &'static str { &CLAIM_REJECTED }
 
 /// Decode a log entry into a NDJSON-ready event object.
 pub fn decode_event(event_name: &str, log: &Value) -> Value {
@@ -359,6 +395,32 @@ pub fn decode_event(event_name: &str, log: &Value) -> Value {
                 event["manifest_hash"] = json!(format!("0x{}", &decoded[3]));
             }
         }
+        "claim.requested" => {
+            if topics.len() >= 3 {
+                event["bounty_id"] = json!(topic_to_u64(&topics[1]));
+                event["performer"] = json!(topic_to_address(&topics[2]));
+            }
+            let decoded = decode_data(data);
+            if !decoded.is_empty() {
+                event["config_hash"] = json!(format!("0x{}", &decoded[0]));
+            }
+        }
+        "claim.acquired" => {
+            if topics.len() >= 3 {
+                event["bounty_id"] = json!(topic_to_u64(&topics[1]));
+                event["performer"] = json!(topic_to_address(&topics[2]));
+            }
+        }
+        "claim.rejected" => {
+            if topics.len() >= 3 {
+                event["bounty_id"] = json!(topic_to_u64(&topics[1]));
+                event["performer"] = json!(topic_to_address(&topics[2]));
+            }
+            let decoded = decode_data(data);
+            if !decoded.is_empty() {
+                event["reason"] = json!(format!("0x{}", &decoded[0]));
+            }
+        }
         _ => {
             event["topics"] = json!(topics);
             event["data"] = json!(data);
@@ -382,6 +444,16 @@ pub fn encode_get_audit(audit_id: u64) -> String {
 pub fn encode_get_delivery_config(bounty_id: u64) -> String {
     let sel = &keccak256(b"getDeliveryConfig(uint256)")[..4];
     format!("0x{}{:064x}", hex::encode(sel), bounty_id)
+}
+
+/// Encode getPendingClaim(uint256 _bountyId, address _performer) view call.
+// checks: none
+// effects: none
+// returns: calldata for getPendingClaim — polls claim state during 2-step flow
+pub fn encode_get_pending_claim(bounty_id: u64, performer_address: &str) -> String {
+    let sel = &keccak256(b"getPendingClaim(uint256,address)")[..4];
+    let addr_clean = performer_address.trim_start_matches("0x").to_lowercase();
+    format!("0x{}{:064x}{:0>64}", hex::encode(sel), bounty_id, addr_clean)
 }
 
 // --- View Call Decoding ---
@@ -618,5 +690,49 @@ mod tests {
         let event = decode_event("unknown.event", &log);
         assert_eq!(event["event"], "unknown.event");
         assert_eq!(event["block"], 10);
+    }
+
+    #[test]
+    fn test_encode_address() {
+        let encoded = encode_address("0x1234567890abcdef1234567890abcdef12345678");
+        assert_eq!(encoded.len(), 32);
+        assert!(encoded[..12].iter().all(|&b| b == 0));
+        assert_eq!(hex::encode(&encoded[12..]), "1234567890abcdef1234567890abcdef12345678");
+    }
+
+    #[test]
+    fn test_encode_request_claim() {
+        let config_hash = [0xAA; 32];
+        let data = encode_request_claim(42, &config_hash);
+        let sel = selector("requestClaim(uint256,bytes32)");
+        assert_eq!(&data[..4], &sel);
+        assert_eq!(data.len(), 4 + 32 + 32);
+        assert_eq!(data[4 + 31], 42);
+        assert_eq!(&data[4 + 32..4 + 64], &config_hash);
+    }
+
+    #[test]
+    fn test_encode_get_pending_claim() {
+        let encoded = encode_get_pending_claim(42, "0x1234567890abcdef1234567890abcdef12345678");
+        let without_prefix = encoded.trim_start_matches("0x");
+        assert!(without_prefix.chars().all(|c| c.is_ascii_hexdigit()));
+        let sel = selector("getPendingClaim(uint256,address)");
+        let sel_hex = hex::encode(sel);
+        assert!(without_prefix.starts_with(&sel_hex));
+        assert_eq!(without_prefix.len(), 8 + 64 + 64);
+    }
+
+    #[test]
+    fn test_claim_event_topics() {
+        let topic = claim_requested_topic();
+        assert!(topic.starts_with("0x"));
+        assert_eq!(topic.len(), 66);
+        let topic2 = bounty_claim_acquired_topic();
+        assert!(topic2.starts_with("0x"));
+        let topic3 = claim_rejected_topic();
+        assert!(topic3.starts_with("0x"));
+        assert_ne!(topic, topic2);
+        assert_ne!(topic, topic3);
+        assert_ne!(topic2, topic3);
     }
 }
