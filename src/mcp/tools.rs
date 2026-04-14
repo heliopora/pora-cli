@@ -97,6 +97,14 @@ pub fn list_tools() -> Value {
                 },
                 "required": ["bounty_id"]
             })),
+            tool_def("pora_performer_request_claim", "[MODIFIES STATE] Request a bounty claim via the 2-step TEE claim flow. Sends requestClaim on-chain, then polls for TEE confirmation (BountyClaimAcquired) or rejection (ClaimRejected). Returns when TEE responds or timeout.", json!({
+                "type": "object",
+                "properties": {
+                    "bounty_id": { "type": "integer", "description": "Bounty ID to claim" },
+                    "timeout": { "type": "integer", "description": "Max seconds to wait for TEE response. Default: 120" }
+                },
+                "required": ["bounty_id"]
+            })),
 
             // === System tools ===
             tool_def("pora_system_doctor", "Check system health: config, network connectivity, wallet balance, performer registration, delivery keys.", json!({
@@ -194,6 +202,11 @@ pub async fn call_tool(params: &Value) -> anyhow::Result<Value> {
         "pora_performer_release" => {
             let bounty_id = arg_u64(&args, "bounty_id")?;
             crate::commands::performer::execute_release_claim(bounty_id).await?
+        }
+        "pora_performer_request_claim" => {
+            let bounty_id = arg_u64(&args, "bounty_id")?;
+            let timeout = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(120);
+            crate::commands::performer::execute_claim(bounty_id, timeout).await?
         }
         "pora_system_doctor" => {
             crate::commands::system::execute_doctor().await?
