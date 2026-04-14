@@ -89,6 +89,70 @@ fn read_key_file(path: &str) -> anyhow::Result<[u8; 32]> {
     Ok(arr)
 }
 
+/// Generate an X25519 keypair for delivery encryption.
+// checks: keys_dir is writable
+// effects: creates delivery.key (private) and delivery.pub (public) in ~/.pora/keys/
+// returns: (private_key_path, public_key_path)
+// SECURITY: private key file is restricted to 0600 on Unix. Never log or print key bytes.
+pub fn generate_x25519_keypair() -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf)> {
+    use rand::rngs::OsRng;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    let keys_dir = crate::config::keys_dir()
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine ~/.pora/keys/ path"))?;
+
+    let priv_path = keys_dir.join("delivery.key");
+    let pub_path = keys_dir.join("delivery.pub");
+
+    let secret = StaticSecret::random_from_rng(OsRng);
+    let public = PublicKey::from(&secret);
+
+    // Write private key
+    std::fs::write(&priv_path, hex::encode(secret.to_bytes()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&priv_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    // Write public key
+    std::fs::write(&pub_path, hex::encode(public.as_bytes()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&pub_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    Ok((priv_path, pub_path))
+}
+
+/// Load the X25519 public key from ~/.pora/keys/delivery.pub.
+// checks: file exists and contains 32 bytes hex
+// effects: reads file
+// returns: 32-byte public key
+pub fn load_delivery_pubkey() -> anyhow::Result<[u8; 32]> {
+    let keys_dir = crate::config::keys_dir()
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine ~/.pora/keys/ path"))?;
+    let pub_path = keys_dir.join("delivery.pub");
+    let content = std::fs::read_to_string(&pub_path)
+        .map_err(|e| anyhow::anyhow!("Cannot read {}: {}", pub_path.display(), e))?;
+    let bytes = hex::decode(content.trim())
+        .map_err(|e| anyhow::anyhow!("Invalid pubkey hex in {}: {}", pub_path.display(), e))?;
+    if bytes.len() != 32 {
+        anyhow::bail!("Pubkey in {} is {} bytes, expected 32", pub_path.display(), bytes.len());
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    Ok(arr)
+}
+
+/// Check if delivery keys exist in ~/.pora/keys/.
+pub fn delivery_keys_exist() -> bool {
+    crate::config::keys_dir()
+        .map(|d| d.join("delivery.key").exists() && d.join("delivery.pub").exists())
+        .unwrap_or(false)
+}
+
 /// Full decryption pipeline: X25519 → HKDF-SHA256 → AES-256-GCM.
 // SECURITY: shared secret is derived fresh and discarded after use.
 // TRUST: ephemeral pubkey came from the manifest, which is hash-verified against on-chain anchor.
@@ -199,6 +263,43 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), plaintext.to_vec());
+    }
+
+    #[test]
+    fn test_x25519_keygen_creates_valid_keypair() {
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        // Use a temp dir to avoid polluting ~/.pora/keys/
+        let tmp = std::env::temp_dir().join("pora_test_keygen");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let priv_path = tmp.join("delivery.key");
+        let pub_path = tmp.join("delivery.pub");
+
+        // Generate keypair manually in temp dir
+        let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let public = PublicKey::from(&secret);
+        std::fs::write(&priv_path, hex::encode(secret.to_bytes())).unwrap();
+        std::fs::write(&pub_path, hex::encode(public.as_bytes())).unwrap();
+
+        // Verify: read back and check pubkey matches
+        let priv_hex = std::fs::read_to_string(&priv_path).unwrap();
+        let pub_hex = std::fs::read_to_string(&pub_path).unwrap();
+        let priv_bytes = hex::decode(priv_hex.trim()).unwrap();
+        let pub_bytes = hex::decode(pub_hex.trim()).unwrap();
+
+        assert_eq!(priv_bytes.len(), 32);
+        assert_eq!(pub_bytes.len(), 32);
+
+        // Derive pubkey from privkey and verify match
+        let mut secret_arr = [0u8; 32];
+        secret_arr.copy_from_slice(&priv_bytes);
+        let derived_secret = StaticSecret::from(secret_arr);
+        let derived_public = PublicKey::from(&derived_secret);
+        assert_eq!(derived_public.as_bytes(), pub_bytes.as_slice());
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

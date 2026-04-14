@@ -11,6 +11,7 @@ pub struct Config {
     pub contract: String,
     pub private_key: Option<String>,
     pub gateway_url: Option<String>,
+    pub reputation_registry: Option<String>,
 }
 
 impl Default for Config {
@@ -20,6 +21,7 @@ impl Default for Config {
             contract: DEFAULT_CONTRACT.to_string(),
             private_key: None,
             gateway_url: None,
+            reputation_registry: None,
         }
     }
 }
@@ -46,6 +48,7 @@ pub fn load_config() -> Config {
         contract: std::env::var("PORA_CONTRACT").unwrap_or_else(|_| DEFAULT_CONTRACT.to_string()),
         private_key: std::env::var("PORA_PRIVATE_KEY").ok(),
         gateway_url: std::env::var("PORA_GATEWAY_URL").ok(),
+        reputation_registry: std::env::var("PORA_REPUTATION_REGISTRY").ok(),
     }
 }
 

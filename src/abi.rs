@@ -150,6 +150,83 @@ pub fn encode_set_delivery_config(
     data
 }
 
+/// Encode cancelBounty(uint256 _bountyId)
+// checks: none
+// effects: none
+// returns: calldata for cancelBounty
+pub fn encode_cancel_bounty(bounty_id: u64) -> Vec<u8> {
+    let mut data = selector("cancelBounty(uint256)").to_vec();
+    data.extend(encode_uint256(bounty_id));
+    data
+}
+
+/// Encode topUpBounty(uint256 _bountyId) — payable, amount sent as tx value
+// checks: none
+// effects: none
+// returns: calldata for topUpBounty
+pub fn encode_top_up_bounty(bounty_id: u64) -> Vec<u8> {
+    let mut data = selector("topUpBounty(uint256)").to_vec();
+    data.extend(encode_uint256(bounty_id));
+    data
+}
+
+/// Encode disputeAudit(uint256 _auditId, bytes32) — second param is unused (bytes32(0))
+// checks: none
+// effects: none
+// returns: calldata for disputeAudit
+// WHY: Solidity signature is disputeAudit(uint256,bytes32) — the bytes32 is a future-proof
+//      slot, currently unused. We pass 0x00...00.
+pub fn encode_dispute_audit(audit_id: u64) -> Vec<u8> {
+    let mut data = selector("disputeAudit(uint256,bytes32)").to_vec();
+    data.extend(encode_uint256(audit_id));
+    data.extend(vec![0u8; 32]); // bytes32(0) — unused param
+    data
+}
+
+/// Encode releaseBountyClaim(uint256 _bountyId)
+// checks: none
+// effects: none
+// returns: calldata for releaseBountyClaim
+pub fn encode_release_bounty_claim(bounty_id: u64) -> Vec<u8> {
+    let mut data = selector("releaseBountyClaim(uint256)").to_vec();
+    data.extend(encode_uint256(bounty_id));
+    data
+}
+
+/// Encode claimAuditPayout(uint256 _auditId)
+// checks: none
+// effects: none
+// returns: calldata for claimAuditPayout
+pub fn encode_claim_audit_payout(audit_id: u64) -> Vec<u8> {
+    let mut data = selector("claimAuditPayout(uint256)").to_vec();
+    data.extend(encode_uint256(audit_id));
+    data
+}
+
+/// Encode registeredPerformers(address) — public mapping auto-getter on LetheMarket.
+// checks: none
+// effects: none
+// returns: calldata for registeredPerformers view call (target: LetheMarket contract)
+// WHY: distinct from encode_get_performer which uses getPerformer(address) — a function
+//      on ReputationRegistry, not LetheMarket.
+pub fn encode_is_registered_performer(address: &str) -> String {
+    let sel = &keccak256(b"registeredPerformers(address)")[..4];
+    let addr_clean = address.trim_start_matches("0x").to_lowercase();
+    format!("0x{}{:0>64}", hex::encode(sel), addr_clean)
+}
+
+/// Encode getPerformer(address) — view call on ReputationRegistry.
+// checks: none
+// effects: none
+// returns: calldata for getPerformer view call (target: ReputationRegistry contract)
+// WHY: this returns (score, totalAudits, successCount, failStreak, status, registeredAt).
+//      Must be called against reputation_registry address, NOT the main LetheMarket contract.
+pub fn encode_get_reputation(address: &str) -> String {
+    let sel = &keccak256(b"getPerformer(address)")[..4];
+    let addr_clean = address.trim_start_matches("0x").to_lowercase();
+    format!("0x{}{:0>64}", hex::encode(sel), addr_clean)
+}
+
 // ============================================================
 // Event decoding + view call encoding (for watch/results/performer start)
 // ============================================================
@@ -307,12 +384,6 @@ pub fn encode_get_delivery_config(bounty_id: u64) -> String {
     format!("0x{}{:064x}", hex::encode(sel), bounty_id)
 }
 
-pub fn encode_get_performer(address: &str) -> String {
-    let sel = &keccak256(b"getPerformer(address)")[..4];
-    let addr_clean = address.trim_start_matches("0x").to_lowercase();
-    format!("0x{}{:0>64}", hex::encode(sel), addr_clean)
-}
-
 // --- View Call Decoding ---
 
 pub struct AuditDeliveryInfo {
@@ -376,7 +447,7 @@ fn topic_to_address(topic: &str) -> String {
     }
 }
 
-fn hex_to_decimal_string(hex: &str) -> String {
+pub fn hex_to_decimal_string(hex: &str) -> String {
     // WHY: amounts in wei can exceed u64. u128 covers up to ~3.4e38.
     let trimmed = hex.trim_start_matches('0');
     if trimmed.is_empty() { return "0".to_string(); }
@@ -385,7 +456,7 @@ fn hex_to_decimal_string(hex: &str) -> String {
         .unwrap_or_else(|_| format!("0x{}", hex))
 }
 
-fn hex_to_u8(hex: &str) -> u8 {
+pub fn hex_to_u8(hex: &str) -> u8 {
     let trimmed = hex.trim_start_matches('0');
     if trimmed.is_empty() { return 0; }
     u8::from_str_radix(trimmed, 16).unwrap_or(0)
@@ -448,16 +519,104 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_get_performer_padding() {
-        let encoded = encode_get_performer("0x1234567890abcdef1234567890abcdef12345678");
-        // Should contain no spaces
-        assert!(!encoded.contains(' '), "encoded calldata contains space characters");
-        // Should be valid hex (0x prefix + hex chars only)
+    fn test_encode_cancel_bounty() {
+        let data = encode_cancel_bounty(42);
+        let sel = selector("cancelBounty(uint256)");
+        assert_eq!(&data[..4], &sel);
+        assert_eq!(data.len(), 4 + 32);
+        // bounty_id = 42
+        assert_eq!(data[4 + 31], 42);
+    }
+
+    #[test]
+    fn test_encode_top_up_bounty() {
+        let data = encode_top_up_bounty(42);
+        let sel = selector("topUpBounty(uint256)");
+        assert_eq!(&data[..4], &sel);
+        assert_eq!(data.len(), 4 + 32);
+        assert_eq!(data[4 + 31], 42);
+    }
+
+    #[test]
+    fn test_encode_dispute_audit() {
+        let data = encode_dispute_audit(7);
+        let sel = selector("disputeAudit(uint256,bytes32)");
+        assert_eq!(&data[..4], &sel);
+        // uint256 + bytes32 = 64 bytes of params
+        assert_eq!(data.len(), 4 + 32 + 32);
+        // audit_id = 7 in first param
+        assert_eq!(data[4 + 31], 7);
+        // second param is all zeros (bytes32(0))
+        assert!(data[4 + 32..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_encode_release_bounty_claim() {
+        let data = encode_release_bounty_claim(42);
+        let sel = selector("releaseBountyClaim(uint256)");
+        assert_eq!(&data[..4], &sel);
+        assert_eq!(data.len(), 4 + 32);
+        assert_eq!(data[4 + 31], 42);
+    }
+
+    #[test]
+    fn test_encode_claim_audit_payout() {
+        let data = encode_claim_audit_payout(7);
+        let sel = selector("claimAuditPayout(uint256)");
+        assert_eq!(&data[..4], &sel);
+        assert_eq!(data.len(), 4 + 32);
+        assert_eq!(data[4 + 31], 7);
+    }
+
+    #[test]
+    fn test_encode_is_registered_performer() {
+        let encoded = encode_is_registered_performer("0x1234567890abcdef1234567890abcdef12345678");
         let without_prefix = encoded.trim_start_matches("0x");
-        assert!(without_prefix.chars().all(|c| c.is_ascii_hexdigit()),
-            "encoded calldata contains non-hex characters: {}", encoded);
-        // Length: 0x + 8 (selector) + 64 (address) = 74 chars
-        assert_eq!(without_prefix.len(), 8 + 64,
-            "unexpected calldata length: {}", without_prefix.len());
+        // No spaces, valid hex
+        assert!(without_prefix.chars().all(|c| c.is_ascii_hexdigit()));
+        // Correct selector
+        let sel = selector("registeredPerformers(address)");
+        let sel_hex = hex::encode(sel);
+        assert!(without_prefix.starts_with(&sel_hex));
+        // Correct length: 8 (selector) + 64 (address)
+        assert_eq!(without_prefix.len(), 8 + 64);
+    }
+
+    #[test]
+    fn test_encode_get_reputation() {
+        let encoded = encode_get_reputation("0x1234567890abcdef1234567890abcdef12345678");
+        let without_prefix = encoded.trim_start_matches("0x");
+        assert!(without_prefix.chars().all(|c| c.is_ascii_hexdigit()));
+        let sel = selector("getPerformer(address)");
+        let sel_hex = hex::encode(sel);
+        assert!(without_prefix.starts_with(&sel_hex));
+        assert_eq!(without_prefix.len(), 8 + 64);
+    }
+
+    #[test]
+    fn test_hex_to_decimal_string() {
+        assert_eq!(hex_to_decimal_string("0000000000000000000000000000000000000000000000000000000000000001"), "1");
+        assert_eq!(hex_to_decimal_string("0000000000000000000000000000000000000000000000000de0b6b3a7640000"), "1000000000000000000");
+        assert_eq!(hex_to_decimal_string("0000000000000000000000000000000000000000000000000000000000000000"), "0");
+    }
+
+    #[test]
+    fn test_is_zero_result() {
+        assert!(is_zero_result("0x0000000000000000000000000000000000000000000000000000000000000000"));
+        assert!(is_zero_result("0x"));
+        assert!(!is_zero_result("0x0000000000000000000000000000000000000000000000000000000000000001"));
+    }
+
+    #[test]
+    fn test_decode_event_unknown() {
+        let log = serde_json::json!({
+            "topics": ["0xabc"],
+            "data": "0x1234",
+            "blockNumber": "0xa",
+            "transactionHash": "0xdeadbeef"
+        });
+        let event = decode_event("unknown.event", &log);
+        assert_eq!(event["event"], "unknown.event");
+        assert_eq!(event["block"], 10);
     }
 }

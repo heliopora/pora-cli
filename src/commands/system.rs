@@ -11,6 +11,12 @@ pub enum SystemAction {
     Doctor,
     /// Show wallet address, network, balance
     Whoami,
+    /// Generate X25519 delivery keypair for encrypted audit results
+    Keygen {
+        /// Overwrite existing keys
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 pub async fn run(action: SystemAction, format: &Format) -> Result<()> {
@@ -47,6 +53,11 @@ pub async fn run(action: SystemAction, format: &Format) -> Result<()> {
                     "performer_config": {
                         "status": if config_dir.join("performer.json").exists() { "configured" } else { "not_configured" },
                     },
+                    "keys": {
+                        "status": if crate::crypto::delivery_keys_exist() { "ok" } else { "missing" },
+                        "path": config::keys_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
+                        "action": if crate::crypto::delivery_keys_exist() { "none" } else { "Run 'pora system keygen' or keys will auto-generate on first submit" },
+                    },
                 }
             });
             output::print_success(format, "system.doctor", &info);
@@ -55,6 +66,23 @@ pub async fn run(action: SystemAction, format: &Format) -> Result<()> {
             let key = config::get_private_key()?;
             let wallet = contract::get_wallet_info(&key).await?;
             output::print_success(format, "system.whoami", &wallet);
+        }
+        SystemAction::Keygen { force } => {
+            use crate::crypto;
+            if crypto::delivery_keys_exist() && !force {
+                anyhow::bail!(
+                    "Keys already exist at ~/.pora/keys/. Use --force to regenerate."
+                );
+            }
+            let (priv_path, pub_path) = crypto::generate_x25519_keypair()?;
+            let pubkey_hex = std::fs::read_to_string(&pub_path)?;
+            let info = serde_json::json!({
+                "private_key": priv_path.to_string_lossy(),
+                "public_key": pub_path.to_string_lossy(),
+                "pubkey_hex": pubkey_hex.trim(),
+                "message": "X25519 delivery keypair generated. BACK UP ~/.pora/keys/delivery.key — it is required to decrypt audit results."
+            });
+            output::print_success(format, "system.keygen", &info);
         }
     }
     Ok(())

@@ -47,6 +47,19 @@ pub enum RequestAction {
         #[arg(long)]
         token: Option<String>,
     },
+    /// Cancel a bounty and reclaim escrowed funds
+    Cancel {
+        /// Bounty ID to cancel
+        bounty_id: u64,
+    },
+    /// Top up a standing bounty's pool (standing bounties only)
+    TopUp {
+        /// Bounty ID to top up
+        bounty_id: u64,
+        /// Amount of ROSE to add
+        #[arg(long)]
+        amount: f64,
+    },
     /// List bounties on the market
     List {
         /// Include closed/cancelled bounties
@@ -74,6 +87,11 @@ pub enum RequestAction {
         /// Output raw plaintext without JSON wrapper
         #[arg(long)]
         raw: bool,
+    },
+    /// Dispute an audit result (requester only, within challenge window)
+    Dispute {
+        /// Audit ID to dispute
+        audit_id: u64,
     },
 }
 
@@ -344,11 +362,20 @@ async fn execute_submit(
         }
     }
 
-    // Step 4: setDeliveryConfig (RequesterOnly mode with placeholder keys for now)
-    // WHY: we use a zero pubkey placeholder — real X25519 keygen comes in a later story.
-    //      The contract requires a non-zero key, so we use a dummy 0x01-prefixed key.
-    let mut encryption_pub_key = [0u8; 32];
-    encryption_pub_key[0] = 0x01; // placeholder non-zero
+    // Step 4: setDeliveryConfig with real X25519 public key
+    // WHY: auto-generate keypair on first submit so users get encrypted delivery
+    //      without a separate setup step. The backup warning is critical — losing
+    //      the private key means losing access to audit results.
+    let encryption_pub_key = if crate::crypto::delivery_keys_exist() {
+        crate::crypto::load_delivery_pubkey()?
+    } else {
+        let (priv_path, _pub_path) = crate::crypto::generate_x25519_keypair()?;
+        eprintln!(
+            "Generated X25519 delivery key at {} — BACK UP THIS FILE, it is required to decrypt audit results",
+            priv_path.display()
+        );
+        crate::crypto::load_delivery_pubkey()?
+    };
     let notification_policy_hash = [0u8; 32];
     let delivery_mode: u8 = 1; // RequesterOnly
 
@@ -452,6 +479,67 @@ fn report_partial_failure(
         successful_txs.join(", "),
         error
     )
+}
+
+/// Cancel a bounty and reclaim escrowed funds.
+// checks: private key configured, bounty_id > 0
+// effects: sends cancelBounty tx on-chain
+// returns: structured JSON with tx hash
+async fn execute_cancel(bounty_id: u64, format: &Format) -> Result<()> {
+    let _key = crate::config::get_private_key()
+        .context("Wallet required for cancel. Set PORA_PRIVATE_KEY")?;
+    let cfg = config::load_config();
+    let data = abi::encode_cancel_bounty(bounty_id);
+    let (tx_hash, _receipt) = tx::send_and_confirm(&cfg.contract, 0, data, 200_000)
+        .await
+        .context("cancelBounty transaction failed")?;
+    output::print_success(format, "request.cancel", &serde_json::json!({
+        "bounty_id": bounty_id,
+        "tx": tx_hash,
+    }));
+    Ok(())
+}
+
+/// Top up a standing bounty's pool.
+// checks: private key configured, amount > 0
+// effects: sends topUpBounty tx on-chain with ROSE value
+// returns: structured JSON with tx hash and amount
+// WHY: topUpBounty(uint256) requires bounty.standing — non-standing bounties will revert.
+async fn execute_topup(bounty_id: u64, amount: f64, format: &Format) -> Result<()> {
+    let _key = crate::config::get_private_key()
+        .context("Wallet required for topup. Set PORA_PRIVATE_KEY")?;
+    let amount_wei = rose_to_wei(amount)?;
+    let cfg = config::load_config();
+    let data = abi::encode_top_up_bounty(bounty_id);
+    let (tx_hash, _receipt) = tx::send_and_confirm(&cfg.contract, amount_wei, data, 200_000)
+        .await
+        .context("topUpBounty transaction failed (is this a standing bounty?)")?;
+    output::print_success(format, "request.topup", &serde_json::json!({
+        "bounty_id": bounty_id,
+        "amount": format!("{} ROSE", amount),
+        "amount_wei": amount_wei.to_string(),
+        "tx": tx_hash,
+    }));
+    Ok(())
+}
+
+/// Dispute an audit result.
+// checks: private key configured
+// effects: sends disputeAudit tx on-chain
+// returns: structured JSON with tx hash
+async fn execute_dispute(audit_id: u64, format: &Format) -> Result<()> {
+    let _key = crate::config::get_private_key()
+        .context("Wallet required for dispute. Set PORA_PRIVATE_KEY")?;
+    let cfg = config::load_config();
+    let data = abi::encode_dispute_audit(audit_id);
+    let (tx_hash, _receipt) = tx::send_and_confirm(&cfg.contract, 0, data, 200_000)
+        .await
+        .context("disputeAudit transaction failed")?;
+    output::print_success(format, "request.dispute", &serde_json::json!({
+        "audit_id": audit_id,
+        "tx": tx_hash,
+    }));
+    Ok(())
 }
 
 /// Stream audit events for a bounty as NDJSON.
@@ -664,6 +752,22 @@ mod tests {
     fn test_rose_to_wei_negative_rejected() {
         assert!(rose_to_wei(-1.0).is_err());
     }
+
+    #[test]
+    fn test_parse_repo_valid() {
+        let (owner, repo) = parse_repo("acme/api").unwrap();
+        assert_eq!(owner, "acme");
+        assert_eq!(repo, "api");
+    }
+
+    #[test]
+    fn test_parse_repo_invalid() {
+        assert!(parse_repo("invalid").is_err());
+        assert!(parse_repo("").is_err());
+        assert!(parse_repo("/").is_err());
+        assert!(parse_repo("owner/").is_err());
+        assert!(parse_repo("/repo").is_err());
+    }
 }
 
 pub async fn run(action: RequestAction, format: &Format) -> Result<()> {
@@ -695,6 +799,12 @@ pub async fn run(action: RequestAction, format: &Format) -> Result<()> {
             )
             .await?;
         }
+        RequestAction::Cancel { bounty_id } => {
+            execute_cancel(bounty_id, format).await?;
+        }
+        RequestAction::TopUp { bounty_id, amount } => {
+            execute_topup(bounty_id, amount, format).await?;
+        }
         RequestAction::List { all } => {
             let bounties = contract::list_bounties(!all).await?;
             output::print_success(
@@ -711,6 +821,9 @@ pub async fn run(action: RequestAction, format: &Format) -> Result<()> {
         }
         RequestAction::Results { audit_id, key, raw } => {
             execute_results(audit_id, key, raw, format).await?;
+        }
+        RequestAction::Dispute { audit_id } => {
+            execute_dispute(audit_id, format).await?;
         }
     }
     Ok(())
